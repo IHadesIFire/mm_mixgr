@@ -1,0 +1,7 @@
+transformers==4.51.0
+accelerate>=1.0.0
+datasets>=2.18.0
+pytrec_eval
+tqdm
+pillow
+numpy

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+cache/
+results/
+*.npz
+*.npy
+*.pt
+*.pth
