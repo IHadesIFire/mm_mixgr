@@ -6,6 +6,8 @@ __pycache__/
 
 cache/
 results/
+content/
+.claude/
 *.npz
 *.npy
 *.pt
