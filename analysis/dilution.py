@@ -139,8 +139,35 @@ def main():
 
     rows: List[dict] = []
     samples_by_class: Dict[str, List[dict]] = defaultdict(list)
+    checkpoint_path = out_dir / "dilution_per_query.csv"
+    done_qids: set[str] = set()
+    if checkpoint_path.exists():
+        with checkpoint_path.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append(r)
+                samples_by_class[r["class"]].append(r)
+                done_qids.add(r["qid"])
+        print(f"[resume] loaded {len(done_qids)} already-done queries from checkpoint")
 
+    CHECKPOINT_EVERY = 10
+    CSV_FIELDNAMES = [
+        "qid", "coarse_domain", "category", "class",
+        "sim_gold_doc", "sim_top_doc_max", "sim_gold_best_sent", "sim_top_best_sent",
+        "n_gold_sents", "n_top_sents",
+        "gold_best_sent_did", "gold_best_sent_text",
+        "top_best_sent_did", "top_best_sent_text",
+    ]
+
+    def flush_checkpoint():
+        with checkpoint_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+
+    new_since_flush = 0
     for z in tqdm(zero_rows, desc="dilution"):
+        if z["qid"] in done_qids:
+            continue
         qid = z["qid"]
         q_src = qid_to_source(qid)
         if q_src not in q_src_to_idx:
@@ -198,7 +225,7 @@ def main():
         top_best_sim, top_best_idx = max_sim(top_emb)
 
         if gold_doc_items:
-            _, gd_emb = encoder.encode_batch_items(gold_doc_items)
+            _, gd_emb = encoder.encode_items(gold_doc_items, batch_size=1, show_progress=False)
             sim_gold_doc = float(np.max(gd_emb @ q_vec))
         else:
             sim_gold_doc = -1.0
@@ -226,20 +253,13 @@ def main():
             row["top_best_sent_text"] = top_sent_pairs[top_best_idx][1][:300]
         rows.append(row)
         samples_by_class[cls].append(row)
+        new_since_flush += 1
+        if new_since_flush >= CHECKPOINT_EVERY:
+            flush_checkpoint()
+            new_since_flush = 0
 
-    csv_path = out_dir / "dilution_per_query.csv"
-    fieldnames = [
-        "qid", "coarse_domain", "category", "class",
-        "sim_gold_doc", "sim_top_doc_max", "sim_gold_best_sent", "sim_top_best_sent",
-        "n_gold_sents", "n_top_sents",
-        "gold_best_sent_did", "gold_best_sent_text",
-        "top_best_sent_did", "top_best_sent_text",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-    print(f"[out] {csv_path}")
+    flush_checkpoint()
+    print(f"[out] {checkpoint_path}")
 
     summary = {
         "n_queries": len(rows),
