@@ -20,12 +20,14 @@ from embeddings.cache import load_embedding_cache
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--max-queries", type=int, default=20)
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
-    cache_dir = (Path(cfg.paths.embedding_cache_dir) / run_dir.name).resolve()
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir \
+        else (Path(cfg.paths.embedding_cache_dir) / run_dir.name).resolve()
 
     predictions = json.loads((run_dir / "predictions.json").read_text(encoding="utf-8"))
     q_cache = load_embedding_cache(cache_dir / "queries.npz")
