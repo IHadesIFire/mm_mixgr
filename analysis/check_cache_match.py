@@ -30,8 +30,14 @@ def main():
         else (Path(cfg.paths.embedding_cache_dir) / run_dir.name).resolve()
 
     predictions = json.loads((run_dir / "predictions.json").read_text(encoding="utf-8"))
-    q_cache = load_embedding_cache(cache_dir / "queries.npz")
-    c_cache = load_embedding_cache(cache_dir / "corpus.npz")
+    q_file = cache_dir / "queries.npz"
+    if not q_file.exists():
+        q_file = cache_dir / "gme-qwen2-vl-7b-instruct_query_all.npz"
+    c_file = cache_dir / "corpus.npz"
+    if not c_file.exists():
+        c_file = cache_dir / "gme-qwen2-vl-7b-instruct_corpus.npz"
+    q_cache = load_embedding_cache(q_file)
+    c_cache = load_embedding_cache(c_file)
     if q_cache is None or c_cache is None:
         print(f"[ERROR] cache not found under {cache_dir}")
         return
