@@ -1,12 +1,13 @@
-"""Dilution analysis v2 — sentences encoded WITH the doc's image (multimodal).
+"""Dilution analysis v2 — same coordinate system as baseline.
 
-For each zero-nDCG query, compute three quantities (all on the same encoder pass,
-same scale):
+q_vec, sim_gold_full and sim_top_full_max are READ from the baseline's cached
+embeddings (queries.npz / corpus.npz) — exactly the vectors that produced the
+nDCG@10 numbers. Only "sentence + gold_image" must be re-encoded since baseline
+never computed it; we use single-item batches to minimise drift.
 
-  sim_gold_full     = sim(query,  gold_doc_text + gold_doc_image)         multimodal
-  sim_gold_sent_max = max over sentences s of  sim(query, s + gold_image) multimodal
-  sim_top_full_max  = max over top-K retrieved docs of sim(query, doc)    multimodal
-                      (re-encoded here, NOT read from predictions.json)
+  sim_gold_full     = q_vec @ corpus_cache[gold_did]                  (cached)
+  sim_top_full_max  = max over top-K of  q_vec @ corpus_cache[did]    (cached)
+  sim_gold_sent_max = max over sentences s of  sim(query, s + gold_image)  (re-encoded)
 
 Classes:
   dilution_winning : gold_sent_max > gold_full AND gold_sent_max > top_full_max
@@ -42,6 +43,7 @@ from tqdm.auto import tqdm
 
 from config import cfg
 from data.loader import _ensure_pil_image, resize_image
+from embeddings.cache import load_embedding_cache
 from embeddings.visual_encoder import create_encoder
 
 SPLIT = "test"
@@ -72,6 +74,8 @@ def classify(sim_full, sim_sent_max, sim_top_max):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--cache-dir", default=None,
+                    help="path containing queries.npz/corpus.npz; auto-resolved if omitted")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--max-queries", type=int, default=None)
     args = ap.parse_args()
@@ -81,6 +85,18 @@ def main():
     per_query_csv = run_dir / "badcase" / "per_query.csv"
     if not per_query_csv.exists():
         raise FileNotFoundError(f"{per_query_csv} not found")
+
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir \
+        else (Path(cfg.paths.embedding_cache_dir) / run_dir.name).resolve()
+    q_cache = load_embedding_cache(cache_dir / "queries.npz")
+    c_cache = load_embedding_cache(cache_dir / "corpus.npz")
+    if q_cache is None or c_cache is None:
+        raise FileNotFoundError(f"queries.npz / corpus.npz not found under {cache_dir}")
+    q_ids, q_embs = q_cache
+    c_ids, c_embs = c_cache
+    q_pos = {qid: i for i, qid in enumerate(q_ids)}
+    c_pos = {did: i for i, did in enumerate(c_ids)}
+    print(f"[cache] queries={len(q_ids)} corpus={len(c_ids)} from {cache_dir}")
 
     out_dir = run_dir / "dilution_v2"
     out_dir.mkdir(exist_ok=True)
@@ -151,25 +167,27 @@ def main():
         qid = z["qid"]
         if qid in done:
             continue
+        if qid not in q_pos:
+            continue
+        q_vec = q_embs[q_pos[qid]]
         q_src = qid_to_source(qid)
         if q_src not in q_idx:
             continue
-        q_row = qds[q_idx[q_src]]
-        q_item = {
-            "id": qid, "text": q_row.get("text"),
-            "image": resize_image(_ensure_pil_image(q_row.get("image"))),
-            "modality": q_row.get("modality", "image,text"),
-        }
-        _, q_emb = enc.encode_batch_items([q_item], instruction=cfg.data.query_instruction)
-        q_vec = q_emb[0]
 
-        # ---- gold side: full doc + each sentence+image ----
+        # ---- gold side ----
+        # sim_gold_full from baseline cache (same coordinate system as nDCG).
+        # sentences+image are re-encoded (baseline never computed them).
         sim_gold_full = -1.0
         sim_sent_max = -1.0
         best_sent_did = ""
         best_sent_text = ""
         n_sents_total = 0
         for did in qrels.get(qid, {}):
+            if did in c_pos:
+                s_full = float(c_embs[c_pos[did]] @ q_vec)
+                if s_full > sim_gold_full:
+                    sim_gold_full = s_full
+
             src = docid_to_source(did)
             if src not in c_idx:
                 continue
@@ -177,21 +195,12 @@ def main():
             d_text = d_row.get("text") or ""
             d_img = resize_image(_ensure_pil_image(d_row.get("image")))
 
-            # full doc
-            full_item = {"id": f"{did}__full", "text": d_text, "image": d_img,
-                         "modality": d_row.get("modality", "image,text")}
-            _, full_emb = enc.encode_batch_items([full_item])
-            s_full = float(full_emb[0] @ q_vec)
-            if s_full > sim_gold_full:
-                sim_gold_full = s_full
-
-            # sentences + image
             sents = split_sentences(d_text)
             n_sents_total += len(sents)
             if not sents:
                 continue
-            sent_items = [{"id": f"{did}__s{i}", "text": s, "image": d_img,
-                           "modality": "image,text" if d_img is not None else "text"}
+            modality = "image,text" if d_img is not None else "text"
+            sent_items = [{"id": f"{did}__s{i}", "text": s, "image": d_img, "modality": modality}
                           for i, s in enumerate(sents)]
             sent_emb = encode_with_image(sent_items)
             sims = sent_emb @ q_vec
@@ -201,23 +210,16 @@ def main():
                 best_sent_did = did
                 best_sent_text = sents[j][:300]
 
-        # ---- top side: re-encode top-K full docs ----
+        # ---- top side: read from baseline cache ----
         ranked = sorted(predictions.get(qid, {}).items(), key=lambda kv: -kv[1])[: args.top_k]
-        top_items = []
-        for did, _ in ranked:
-            src = docid_to_source(did)
-            if src not in c_idx:
-                continue
-            d_row = cds[c_idx[src]]
-            top_items.append({
-                "id": did, "text": d_row.get("text"),
-                "image": resize_image(_ensure_pil_image(d_row.get("image"))),
-                "modality": d_row.get("modality", "image,text"),
-            })
         sim_top_full_max = -1.0
-        if top_items:
-            _, t_emb = enc.encode_items(top_items, batch_size=1, show_progress=False)
-            sim_top_full_max = float(np.max(t_emb @ q_vec))
+        for did, saved in ranked:
+            if did in c_pos:
+                s = float(c_embs[c_pos[did]] @ q_vec)
+                if abs(s - saved) > 1e-4:
+                    print(f"[cache-mismatch] {qid} {did} saved={saved:.4f} recomputed={s:.4f}")
+                if s > sim_top_full_max:
+                    sim_top_full_max = s
 
         cls = classify(sim_gold_full, sim_sent_max, sim_top_full_max)
         rows.append({
