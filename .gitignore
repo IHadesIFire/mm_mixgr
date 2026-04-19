@@ -1,0 +1,23 @@
+﻿__pycache__/
+cache/
+*.npz
+*.pyc
+*.zip
+samples/
+results/attention_vis/
+results/gradcam_vis/
+# 模型 / 大文件
+checkpoints/
+*.pt
+*.pth
+*.bin
+
+# 实验结果
+results/
+
+# python缓存
+__pycache__/
+*.pyc
+
+# 其他
+*.log
