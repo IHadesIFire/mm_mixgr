@@ -12,6 +12,7 @@ from datasets import load_from_disk
 #from transformers import CLIPModel, CLIPProcessor
 from transformers import CLIPModel, CLIPProcessor, AutoModel, AutoProcessor
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+from postprocess_regions import PostProcessConfig, postprocess_sam_regions
 
 
 # =========================
@@ -364,6 +365,7 @@ def process_one_sample(
     clip_scorer: CLIPScorer,
     mask_generator,
     max_regions: int,
+    post_cfg: PostProcessConfig,
     item_prefix: str = "query",
 ):
     item_id = str(row["id"])
@@ -383,19 +385,22 @@ def process_one_sample(
         image = image.convert("RGB")
         image.save(out_dir / f"image_{img_idx}_orig.jpg")
 
-        anns = mask_generator.generate(np.array(image))
+        anns_raw = mask_generator.generate(np.array(image))
 
-        filtered_anns = []
-        for ann in anns:
-            x, y, w, h = ann["bbox"]
-            if w < 8 or h < 8:
-                continue
-            if w * h < 100:
-                continue
-            filtered_anns.append(ann)
+        anns, pp_debug = postprocess_sam_regions(
+            image=image,
+            anns=anns_raw,
+            cfg=post_cfg,
+        )
 
-        anns = filtered_anns[:max_regions]
-        print(f"[{item_prefix}:{item_id}] image_{img_idx}: {len(anns)} regions")
+        print(
+            f"[{item_prefix}:{item_id}] image_{img_idx}: "
+            f"raw_regions={len(anns_raw)}, "
+            f"post_regions={len(anns)}, "
+            f"removed_small={pp_debug['removed_small']}, "
+            f"removed_slender={pp_debug['removed_slender']}, "
+            f"removed_duplicate={pp_debug['removed_duplicate']}"
+        )
 
         if len(anns) == 0:
             continue
@@ -617,6 +622,23 @@ def main():
         device=args.device,
     )
 
+    post_cfg = PostProcessConfig(
+        min_width=12,
+        min_height=12,
+        min_box_area=180,
+        min_mask_area=120,
+
+        max_aspect_ratio=10.0,
+
+        dedup_by_box_iou=True,
+        box_iou_thresh=0.65,
+
+        dedup_by_mask_iou=False,
+        mask_iou_thresh=0.80,
+
+        max_regions=args.max_regions,
+    )
+
     # =========================
     # 先处理 query
     # =========================
@@ -689,6 +711,7 @@ def main():
             clip_scorer=clip_scorer,
             mask_generator=mask_generator,
             max_regions=args.max_regions,
+            post_cfg=post_cfg,
             item_prefix="query",
         )
 
@@ -762,6 +785,7 @@ def main():
             clip_scorer=clip_scorer,
             mask_generator=mask_generator,
             max_regions=args.max_regions,
+            post_cfg=post_cfg,
             item_prefix="doc",
         )
 
