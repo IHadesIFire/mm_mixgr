@@ -74,8 +74,11 @@ SENTENCES = [
      "schematic"),
 ]
 
-# 只探最强那层 (上次验证: layer 20 信号最干净)
-LAYER_TO_PROBE = 20
+# 多层扫描: 上次 layer 20 只对了 ~2/4, 换几层看哪层空间分辨率最好
+# 14 = 中层 (语义已成形但还保留较多 local spatial 信息)
+# 20 = 深一点 (上次单词 subiculum 对齐最强)
+# 27 = 接近顶层 (高度抽象, 可能过度 pooled)
+LAYERS_TO_PROBE = [14, 20, 27]
 
 # 输出目录
 _here = Path(__file__).resolve()
@@ -98,15 +101,16 @@ def forward_for_sentence(
     image: Image.Image,
     sentence: str,
     key_noun: str,
+    layers: list[int],
 ):
     """
     对 (image, sentence) forward 一次, 返回:
-      - rel_1d: [num_visual_tokens]  key_noun 的 subword hidden vs 每个 visual token 的 cosine
-                  (多个 subword 做 FOCUS 式 element-wise 相乘 consensus)
+      - rel_1d_per_layer: {layer: [num_visual_tokens]}  每层一张 relevance map
       - image_grid_thw: 用于 reshape 回 2D
 
     sentence = 送给模型的完整上下文句子
     key_noun = 句子里人工挑的主题词, 只用它的 subword 位置做 target
+    layers   = 要探的层列表, 一次 forward 全部抓回来
     """
     # 构造 chat template 输入 (整句作为上下文)
     messages = [
@@ -169,14 +173,15 @@ def forward_for_sentence(
     with torch.inference_mode():
         _ = gme_model(**inputs)
 
-    if LAYER_TO_PROBE not in captured:
-        raise RuntimeError(f"layer {LAYER_TO_PROBE} 未被 hook 捕获")
+    rel_1d_per_layer: dict[int, "torch.Tensor"] = {}
+    for layer in layers:
+        if layer not in captured:
+            raise RuntimeError(f"layer {layer} 未被 hook 捕获")
+        hs = captured[layer]  # [1, seq, hidden]
+        # 多 subword target: compute_relevance_map 会逐个算 → 归一化 → 相乘 (FOCUS consensus)
+        rel_1d_per_layer[layer] = compute_relevance_map(hs, visual_idx, target_indices)
 
-    hs = captured[LAYER_TO_PROBE]  # [1, seq, hidden]
-    # 多 subword target: compute_relevance_map 会逐个算 → 归一化 → 相乘 (FOCUS consensus)
-    rel_1d = compute_relevance_map(hs, visual_idx, target_indices)
-
-    return rel_1d, inputs.get("image_grid_thw")
+    return rel_1d_per_layer, inputs.get("image_grid_thw")
 
 
 # ============================================================
@@ -242,31 +247,35 @@ def main():
     # 2. 加载 GME
     gme_model, processor = load_gme()
 
-    # 3. 装 hook, 只装在目标层
-    captured, cleanup = install_hidden_state_hooks(gme_model, [LAYER_TO_PROBE])
+    # 3. 装 hook, 一次性装所有目标层 (一次 forward 全拿)
+    captured, cleanup = install_hidden_state_hooks(gme_model, LAYERS_TO_PROBE)
 
-    # 4. 依次跑每个 (句子, key_noun)
-    results = []  # list of (sentence, key_noun, rel_2d)
+    # 4. 依次跑每个 (句子, key_noun), 每次 forward 抓所有层
+    # results_per_layer[layer] = list of (sent, noun, rel_2d)
+    results_per_layer: dict[int, list] = {L: [] for L in LAYERS_TO_PROBE}
     try:
         for i, (sent, noun) in enumerate(SENTENCES):
             print(f"\n[句子 {i+1}/{len(SENTENCES)}] key_noun='{noun}'")
             print(f"    {sent}")
-            rel_1d, grid_thw = forward_for_sentence(
-                gme_model, captured, processor, image, sent, noun
+            rel_1d_per_layer, grid_thw = forward_for_sentence(
+                gme_model, captured, processor, image, sent, noun, LAYERS_TO_PROBE
             )
-            rel_2d = reshape_to_2d(rel_1d, grid_thw)
-            print(
-                f"    rel_2d stats: min={rel_2d.min():.3f}, max={rel_2d.max():.3f}, "
-                f"mean={rel_2d.mean():.3f}, std={rel_2d.std():.3f}"
-            )
-            results.append((sent, noun, rel_2d))
+            for layer in LAYERS_TO_PROBE:
+                rel_2d = reshape_to_2d(rel_1d_per_layer[layer], grid_thw)
+                print(
+                    f"    [layer {layer}] rel_2d stats: "
+                    f"min={rel_2d.min():.3f}, max={rel_2d.max():.3f}, "
+                    f"mean={rel_2d.mean():.3f}, std={rel_2d.std():.3f}"
+                )
+                results_per_layer[layer].append((sent, noun, rel_2d))
     finally:
         cleanup()
 
-    # 5. 可视化
-    grid_path = OUT_DIR / f"sentence_grid_layer{LAYER_TO_PROBE:02d}.png"
-    save_grid(image, results, grid_path)
-    save_per_sentence(image, results, OUT_DIR, LAYER_TO_PROBE)
+    # 5. 可视化: 每层一张 grid + 每层每句一张大图
+    for layer in LAYERS_TO_PROBE:
+        grid_path = OUT_DIR / f"sentence_grid_layer{layer:02d}.png"
+        save_grid(image, results_per_layer[layer], grid_path)
+        save_per_sentence(image, results_per_layer[layer], OUT_DIR, layer)
 
     # 6. 打印判读提示
     print("\n" + "=" * 60)
