@@ -78,17 +78,25 @@ print(f"[init] 输出目录: {OUT_DIR}")
 # Step 1: 加载图像
 # ============================================================
 def load_subiculum_image() -> Image.Image:
-    """从 MRMR corpus 找到 subiculum 那条并取出 image 列."""
-    print(f"[1/6] 加载 MRMR corpus, 找 {TARGET_DOC_ID} ...")
+    """从 MRMR corpus 找到 subiculum 那条并取出 image 列.
+
+    关键: 走本地/Drive 缓存, 不 streaming (streaming 永远走网络, 会重新下 shard).
+    依赖 HF_DATASETS_CACHE 指向已缓存的目录 + HF_DATASETS_OFFLINE=1.
+    Colab 里必须先挂 Drive + 设 env (见运行说明).
+    """
+    print(f"[1/6] load MRMR corpus from cache, 找 {TARGET_DOC_ID} ...")
+    print(f"    HF_DATASETS_CACHE = {os.environ.get('HF_DATASETS_CACHE', '<unset>')}")
+    print(f"    HF_DATASETS_OFFLINE = {os.environ.get('HF_DATASETS_OFFLINE', '<unset>')}")
     ds = load_dataset("MRMRbenchmark/knowledge", "corpus", split="test")
-    for raw_idx in range(len(ds)):
+    n = len(ds)
+    print(f"    corpus 行数 = {n}")
+    for raw_idx in range(n):
         row = ds[raw_idx]
         if str(row.get("id")) == TARGET_DOC_ID:
             img = row.get("image")
             if img is None:
                 raise RuntimeError("这条 row 的 image 列是空的")
             if not isinstance(img, Image.Image):
-                # HF datasets 有时返回 dict {'bytes':..., 'path':...}
                 from io import BytesIO
                 img = Image.open(BytesIO(img["bytes"]))
             img = img.convert("RGB")
@@ -134,35 +142,49 @@ def load_gme():
 # ============================================================
 def get_base_qwen2vl(gme_model):
     """
-    GME wrap 了 Qwen2VL. 要拿 hidden_states 必须调底层 forward.
-    常见路径(按优先级试):
-      - gme_model.base
-      - gme_model.model
-      - gme_model itself (如果 GME 其实就是直接继承 Qwen2VLForConditionalGeneration)
-    打印结构帮助定位.
+    找到 Qwen2VLForConditionalGeneration 层(能吃 pixel_values + image_grid_thw 的那层).
+    Qwen2VLModel 是它的子模块, 只能吃 inputs_embeds, 不吃 pixel_values ——
+    之前栽在这上面过. 所以必须精确匹配 "ForConditionalGeneration" 后缀.
     """
-    print("[3/6] 定位底层 Qwen2VL forward 入口 ...")
+    print("[3/6] 定位 Qwen2VLForConditionalGeneration ...")
 
-    candidates = []
-    for attr in ["base", "model", "qwen2_vl", "vlm"]:
-        if hasattr(gme_model, attr):
-            candidates.append((attr, getattr(gme_model, attr)))
+    def _is_cond_gen(m) -> bool:
+        # 同时兼容未来 class 名字变动: 要么后缀对, 要么 forward 签名吃 pixel_values
+        name = type(m).__name__
+        if name.endswith("ForConditionalGeneration"):
+            return True
+        # 更稳: 看 forward 签名
+        import inspect
+        try:
+            sig = inspect.signature(m.forward)
+            return "pixel_values" in sig.parameters
+        except (TypeError, ValueError):
+            return False
 
-    if not candidates:
-        # GME 自己就是 Qwen2VL 的情况
-        print("    没找到 wrap 属性, 假设 gme_model 自己就是 Qwen2VL")
+    # 1) gme_model 自己就是?
+    if _is_cond_gen(gme_model):
+        print(f"    gme_model 自己就是 {type(gme_model).__name__}")
         return gme_model
 
-    for attr, sub in candidates:
-        cls_name = type(sub).__name__
-        print(f"    候选: gme_model.{attr} → {cls_name}")
-        if "Qwen2VL" in cls_name or hasattr(sub, "model"):
-            print(f"    选用: gme_model.{attr}")
-            return sub
+    # 2) 一级子属性
+    for attr in ["base", "model", "vlm", "qwen2_vl"]:
+        if hasattr(gme_model, attr):
+            sub = getattr(gme_model, attr)
+            print(f"    候选: gme_model.{attr} → {type(sub).__name__}")
+            if _is_cond_gen(sub):
+                print(f"    选用: gme_model.{attr}")
+                return sub
 
-    # 兜底: 取第一个
-    print(f"    兜底选第一个: gme_model.{candidates[0][0]}")
-    return candidates[0][1]
+    # 3) 广度扫描全部 named_modules, 找第一个 forward 吃 pixel_values 的
+    print("    一级没找到, 广度扫 named_modules ...")
+    for name, mod in gme_model.named_modules():
+        if _is_cond_gen(mod):
+            print(f"    选用: gme_model.{name} → {type(mod).__name__}")
+            return mod
+
+    raise RuntimeError(
+        f"找不到吃 pixel_values 的 forward. gme_model 类型 = {type(gme_model).__name__}"
+    )
 
 
 # ============================================================
