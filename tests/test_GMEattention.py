@@ -140,59 +140,56 @@ def load_gme():
 # ============================================================
 # Step 3: 定位 "底层 Qwen2VL" 的 forward 入口
 # ============================================================
-def get_base_forward(gme_model):
+def install_hidden_state_hooks(gme_model, layer_indices):
     """
-    返回一个 forward 函数, 它跑 Qwen2VLForConditionalGeneration 的 forward,
-    返回带 hidden_states 的 ModelOutput(绕过 GME 的池化 override).
+    GME 自己 override 了 forward, 返回的是池化 embedding, 拿不到 hidden_states.
+    而且 GME 不继承 Qwen2VLForConditionalGeneration, 没法调父类 forward 绕过.
+    解决: 在 gme_model.model.layers[k] 上装 forward hook, 抓每层输出.
+    然后 gme_model(**inputs) 正常跑, 输出忽略, 需要的 hidden_states 已经进 captured dict.
 
-    GME 的两种可能结构:
-    (A) GmeQwen2VL 继承自 Qwen2VLForConditionalGeneration, override 了 forward
-        → 用 父类.forward(gme_model, **kwargs) 绕过 override
-    (B) GmeQwen2VL 里挂了 .base / .model = Qwen2VLForConditionalGeneration
-        → 直接调 sub.forward
+    Returns:
+        captured: dict 会在 forward 跑完后填好 {layer_idx: Tensor[1, seq, hidden]}
+        cleanup: 调用后移除所有 hook, 避免内存泄漏
     """
-    print("[3/6] 定位 Qwen2VLForConditionalGeneration.forward ...")
+    print("[3/6] 装 forward hook 捕获 hidden states ...")
+    if not hasattr(gme_model, "model") or not hasattr(gme_model.model, "layers"):
+        raise RuntimeError(
+            f"gme_model.model.layers 不存在. "
+            f"gme_model={type(gme_model).__name__}, children={[n for n,_ in gme_model.named_children()]}"
+        )
 
-    # 方案 A: 检查继承链
-    for base in type(gme_model).__mro__[1:]:  # 跳过 GME 自己
-        if base.__name__.endswith("ForConditionalGeneration"):
-            print(f"    GME 继承自 {base.__name__}, 用父类 forward 绕开 GME 的池化 override")
-            def _fwd(**kwargs):
-                return base.forward(gme_model, **kwargs)
-            return _fwd
+    layers = gme_model.model.layers
+    num_layers = len(layers)
+    print(f"    gme_model.model.layers 共 {num_layers} 层")
 
-    # 方案 B: 检查一级子属性
-    for attr in ["base", "model", "vlm", "qwen2_vl"]:
-        if hasattr(gme_model, attr):
-            sub = getattr(gme_model, attr)
-            print(f"    候选: gme_model.{attr} → {type(sub).__name__}")
-            if type(sub).__name__.endswith("ForConditionalGeneration"):
-                print(f"    选用: gme_model.{attr}.forward")
-                return sub.forward
+    captured: dict = {}
+    handles = []
 
-    # 兜底: 广度扫
-    print("    一级没找到, 广度扫 named_modules ...")
-    for name, mod in gme_model.named_modules():
-        if type(mod).__name__.endswith("ForConditionalGeneration"):
-            print(f"    选用: gme_model.{name}.forward")
-            return mod.forward
+    def make_hook(idx):
+        def hook(mod, inp, out):
+            # Qwen2 decoder layer 返回 tuple, 第一个是 hidden_state
+            captured[idx] = out[0] if isinstance(out, tuple) else out
+        return hook
 
-    # 还没找到: 打印 MRO 和 children 帮排查
-    print("    诊断信息:")
-    print(f"      gme_model type = {type(gme_model).__name__}")
-    print(f"      MRO = {[b.__name__ for b in type(gme_model).__mro__]}")
-    print("      named_children:")
-    for name, sub in gme_model.named_children():
-        print(f"        {name}: {type(sub).__name__}")
-    raise RuntimeError(
-        "找不到 Qwen2VLForConditionalGeneration 的 forward"
-    )
+    for k in layer_indices:
+        if k < 0 or k >= num_layers:
+            print(f"    跳过越界 layer {k} (范围 0~{num_layers-1})")
+            continue
+        h = layers[k].register_forward_hook(make_hook(k))
+        handles.append(h)
+        print(f"    hook 装在 gme_model.model.layers[{k}]")
+
+    def cleanup():
+        for h in handles:
+            h.remove()
+
+    return captured, cleanup
 
 
 # ============================================================
 # Step 4: 构造输入 & forward 拿 hidden_states
 # ============================================================
-def forward_and_get_hidden_states(fwd_fn, processor, image: Image.Image, query_text: str):
+def forward_and_get_hidden_states(gme_model, captured, processor, image: Image.Image, query_text: str):
     """
     用 Qwen2-VL 的 chat template 构造 (image, text) 输入, forward 一次, 返回:
       - hidden_states: tuple of [1, seq_len, hidden_dim], 长度 = num_layers+1 (含 embedding)
@@ -279,33 +276,23 @@ def forward_and_get_hidden_states(fwd_fn, processor, image: Image.Image, query_t
     decoded = tok.decode(input_ids[0, target_token_indices])
     print(f"    decoded target tokens: '{decoded}'")
 
-    # Forward: fwd_fn 是 Qwen2VLForConditionalGeneration.forward 的绑定版本,
-    # 绕开 GME 的池化 override, 返回带 hidden_states 的 ModelOutput
-    print("    forward...")
+    # Forward: GME 正常跑自己的 forward, 返回池化 embedding(忽略).
+    # hook 会把中间层 hidden state 写进 captured dict.
+    print("    forward (via GME, hooks capture hidden states)...")
+    captured.clear()
     with torch.inference_mode():
-        outputs = fwd_fn(
-            **inputs,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        _ = gme_model(**inputs)
 
-    # sanity: 如果 outputs 是 Tensor, 说明落到 GME 的外层 forward 了 (返回池化 embedding)
-    if isinstance(outputs, torch.Tensor):
+    if not captured:
         raise RuntimeError(
-            f"forward 返回了 Tensor shape={tuple(outputs.shape)}, "
-            f"说明 fwd_fn 定位错了, 落到 GME 外层 forward 了."
+            "hook 没抓到任何 hidden state. 检查 gme_model.model.layers 是否被 forward 调到了."
         )
-    if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
-        raise RuntimeError(
-            f"outputs.hidden_states 为空. outputs 类型 = {type(outputs).__name__}, "
-            f"属性 = {list(vars(outputs).keys()) if hasattr(outputs, '__dict__') else 'n/a'}"
-        )
-    hidden_states = outputs.hidden_states  # tuple, len = num_layers + 1
-    print(f"    num layers (含 embedding) = {len(hidden_states)}")
-    print(f"    hidden dim = {hidden_states[0].shape[-1]}")
+    print(f"    captured layers: {sorted(captured.keys())}")
+    sample = next(iter(captured.values()))
+    print(f"    hidden dim = {sample.shape[-1]}, seq_len = {sample.shape[1]}")
 
     return {
-        "hidden_states": hidden_states,
+        "captured": captured,  # dict: layer_idx → [1, seq, hidden]
         "input_ids": input_ids,
         "image_grid_thw": inputs.get("image_grid_thw"),
         "visual_token_indices": visual_token_indices,
@@ -433,15 +420,18 @@ def main():
     # 2. 加载 GME
     gme_model, processor = load_gme()
 
-    # 3. 定位 Qwen2VLForConditionalGeneration.forward, 绕开 GME 池化
-    fwd_fn = get_base_forward(gme_model)
+    # 3. 装 forward hook 捕获中间层 hidden states
+    captured, cleanup = install_hidden_state_hooks(gme_model, LAYERS_TO_PROBE)
 
-    # 4. Forward + 拿 hidden_states
+    # 4. Forward + 拿 hidden_states (GME 正常跑, hook 抓取)
     # 用 FOCUS 论文的 existence prompt 格式, 让 target 作为自然句里的一个 token 出现
     query_text = f"Is there a {TARGET_WORD} in the image?"
-    data = forward_and_get_hidden_states(fwd_fn, processor, image, query_text)
+    try:
+        data = forward_and_get_hidden_states(gme_model, captured, processor, image, query_text)
+    finally:
+        cleanup()
 
-    hidden_states = data["hidden_states"]
+    captured_hs = data["captured"]  # dict: layer_idx → [1, seq, hidden]
     visual_idx = data["visual_token_indices"]
     target_idx = data["target_token_indices"]
     image_grid_thw = data["image_grid_thw"]
@@ -451,15 +441,12 @@ def main():
 
     # 5. 对每层算 relevance map 并可视化
     print(f"[5/6] 为层 {LAYERS_TO_PROBE} 计算 relevance map ...")
-    num_layers_with_embed = len(hidden_states)  # = num_layers + 1
     for layer_idx in LAYERS_TO_PROBE:
-        # hidden_states[0] 是 embedding 输出, hidden_states[k] 是第 k 层 transformer 后
-        hs_idx = layer_idx + 1  # +1 因为 hidden_states[0] 是 embedding
-        if hs_idx >= num_layers_with_embed:
-            print(f"    跳过 layer={layer_idx}, 超出范围")
+        if layer_idx not in captured_hs:
+            print(f"    跳过 layer={layer_idx}, 未被 hook 捕获")
             continue
         print(f"    layer {layer_idx} ...")
-        rel_1d = compute_relevance_map(hidden_states[hs_idx], visual_idx, target_idx)
+        rel_1d = compute_relevance_map(captured_hs[layer_idx], visual_idx, target_idx)
         rel_2d = reshape_to_2d(rel_1d, image_grid_thw)
         # 打印统计量, 判断是不是糊成一片
         print(
