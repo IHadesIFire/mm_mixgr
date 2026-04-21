@@ -148,25 +148,13 @@ def get_base_qwen2vl(gme_model):
     """
     print("[3/6] 定位 Qwen2VLForConditionalGeneration ...")
 
+    # 只认严格的 class 名后缀, 不看 forward 签名 ——
+    # GME 外层 forward 也吃 pixel_values (kwargs 透传), 但它返回的是池化 embedding,
+    # 不是 ModelOutput, 拿不到 hidden_states. 必须找底层 Qwen2VLForConditionalGeneration.
     def _is_cond_gen(m) -> bool:
-        # 同时兼容未来 class 名字变动: 要么后缀对, 要么 forward 签名吃 pixel_values
-        name = type(m).__name__
-        if name.endswith("ForConditionalGeneration"):
-            return True
-        # 更稳: 看 forward 签名
-        import inspect
-        try:
-            sig = inspect.signature(m.forward)
-            return "pixel_values" in sig.parameters
-        except (TypeError, ValueError):
-            return False
+        return type(m).__name__.endswith("ForConditionalGeneration")
 
-    # 1) gme_model 自己就是?
-    if _is_cond_gen(gme_model):
-        print(f"    gme_model 自己就是 {type(gme_model).__name__}")
-        return gme_model
-
-    # 2) 一级子属性
+    # 1) 一级子属性优先 (GME 的标准结构: gme_model.base = Qwen2VLForConditionalGeneration)
     for attr in ["base", "model", "vlm", "qwen2_vl"]:
         if hasattr(gme_model, attr):
             sub = getattr(gme_model, attr)
@@ -175,15 +163,20 @@ def get_base_qwen2vl(gme_model):
                 print(f"    选用: gme_model.{attr}")
                 return sub
 
-    # 3) 广度扫描全部 named_modules, 找第一个 forward 吃 pixel_values 的
+    # 2) 广度扫描
     print("    一级没找到, 广度扫 named_modules ...")
     for name, mod in gme_model.named_modules():
         if _is_cond_gen(mod):
             print(f"    选用: gme_model.{name} → {type(mod).__name__}")
             return mod
 
+    # 3) gme_model 自己就是(兜底)
+    if _is_cond_gen(gme_model):
+        print(f"    兜底: gme_model 自己就是 {type(gme_model).__name__}")
+        return gme_model
+
     raise RuntimeError(
-        f"找不到吃 pixel_values 的 forward. gme_model 类型 = {type(gme_model).__name__}"
+        f"找不到 Qwen2VLForConditionalGeneration. gme_model 类型 = {type(gme_model).__name__}"
     )
 
 
@@ -287,6 +280,18 @@ def forward_and_get_hidden_states(model, processor, image: Image.Image, query_te
             return_dict=True,
         )
 
+    # sanity: 如果 outputs 是 Tensor, 说明落到 GME 的外层 forward 了 (返回池化 embedding)
+    if isinstance(outputs, torch.Tensor):
+        raise RuntimeError(
+            f"forward 返回了 Tensor shape={tuple(outputs.shape)}, "
+            f"说明 base 定位错了, 落到 GME 外层 forward 了. "
+            f"base 类型应该是 *ForConditionalGeneration, 实际 = {type(model).__name__}"
+        )
+    if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
+        raise RuntimeError(
+            f"outputs.hidden_states 为空. outputs 类型 = {type(outputs).__name__}, "
+            f"属性 = {list(vars(outputs).keys()) if hasattr(outputs, '__dict__') else 'n/a'}"
+        )
     hidden_states = outputs.hidden_states  # tuple, len = num_layers + 1
     print(f"    num layers (含 embedding) = {len(hidden_states)}")
     print(f"    hidden dim = {hidden_states[0].shape[-1]}")
