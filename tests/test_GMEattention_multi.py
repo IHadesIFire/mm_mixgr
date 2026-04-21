@@ -1,12 +1,13 @@
-"""多句子版 GME 空间对齐探针.
+"""多句子版 GME 空间对齐探针 (key_noun 策略).
 
-目的: 验证 GME 的 relevance map 是否真的随**句子语义**移到不同区域,
+目的: 验证 GME 的 relevance map 是否随**主题词**移到不同区域,
 还是之前 subiculum 的成功只是"认图里的 'Sub' 字样".
 
 策略:
-- 4 个句子, 刻意避开图里的文字标签 (EC/DG/Sub/CA1/CA3)
-- 每句用 **句子最后一个内容 token** 的 hidden state 当 target
-  (GME 本身就是 last-token pooling, 语义等价于整句的 GME 表征)
+- 4 对 (sentence, key_noun), 每句瞄准空间上能区分的解剖区域,
+  key_noun 是人工挑的主题词, 刻意不含图里的文字标签 (EC/DG/Sub/CA1/CA3)
+- 整句作为上下文送模型; target = key_noun 的 subword 位置
+  (和 subiculum 实验同一套逻辑, FOCUS 式 subword consensus)
 - 只探 layer 20 (上次验证最强)
 - 输出 grid: N 行 × 2 列 (heatmap | overlay), 另外每句单独一张大图
 
@@ -14,6 +15,11 @@
     本地:  python -m tests.test_GMEattention_multi
     Colab: !cd /content/mm_mixgr && python -m tests.test_GMEattention_multi
     (Colab 前需挂 Drive + 设 HF_*_CACHE 到 Drive)
+
+之前 last-content-token 策略失败的原因:
+    句号/EOS token 在 causal LM 里是 attention sink, 承载的是
+    "陈述句结束" 这种格式信号, 而不是句子具体语义. 所以 4 句产出几乎一模一样的 map.
+    换回 subword-level 的 key_noun target, 即回到 subiculum 成功那套信号通道.
 """
 
 from __future__ import annotations
@@ -48,17 +54,24 @@ from tests.test_GMEattention import (
 # ============================================================
 # 配置区
 # ============================================================
-# 4 句测试文本, 每句瞄准一个空间上能区分的解剖区域,
+# 4 句测试文本 + 人工挑的 key noun (subword-level target).
+# 策略: 整句送给模型提供上下文, 但 target 只用 key noun 的 subword 位置
+# (和 subiculum 实验一样, FOCUS 式 subword map 相乘做 consensus).
+# 每句瞄准一个空间上能区分的解剖区域,
 # 刻意不含图中出现的标签词 (EC / DG / Sub / CA1 / CA3 / subiculum / hippocampus)
 SENTENCES = [
     # S1 → 左侧内嗅皮层 (EC 那一大片分层结构)
-    "Stratified cortical layers with apical dendrites extending toward the pial surface.",
+    ("Stratified cortical layers with apical dendrites extending toward the pial surface.",
+     "dendrites"),
     # S2 → 顶部齿状回 (DG 那个 V 形结构)
-    "Densely packed granule cells arranged in a V-shaped layer.",
+    ("Densely packed granule cells arranged in a V-shaped layer.",
+     "granule"),
     # S3 → 右侧主海马 (CA1/CA3 的锥体神经元弧)
-    "Large pyramidal neurons aligned in a single dense row along a curved arc.",
+    ("Large pyramidal neurons aligned in a single dense row along a curved arc.",
+     "pyramidal"),
     # S4 → 左下角插图
-    "A simplified schematic block diagram with labeled arrows between boxes.",
+    ("A simplified schematic block diagram with labeled arrows between boxes.",
+     "schematic"),
 ]
 
 # 只探最强那层 (上次验证: layer 20 信号最干净)
@@ -78,13 +91,24 @@ print(f"[init] 输出目录: {OUT_DIR}")
 # ============================================================
 # 单次 forward: 拿句子的 last-content-token 对 visual token 的 relevance
 # ============================================================
-def forward_for_sentence(gme_model, captured: dict, processor, image: Image.Image, sentence: str):
+def forward_for_sentence(
+    gme_model,
+    captured: dict,
+    processor,
+    image: Image.Image,
+    sentence: str,
+    key_noun: str,
+):
     """
     对 (image, sentence) forward 一次, 返回:
-      - rel_1d: [num_visual_tokens] 句子最后 content token vs 每个 visual token 的 cosine
+      - rel_1d: [num_visual_tokens]  key_noun 的 subword hidden vs 每个 visual token 的 cosine
+                  (多个 subword 做 FOCUS 式 element-wise 相乘 consensus)
       - image_grid_thw: 用于 reshape 回 2D
+
+    sentence = 送给模型的完整上下文句子
+    key_noun = 句子里人工挑的主题词, 只用它的 subword 位置做 target
     """
-    # 构造 chat template 输入
+    # 构造 chat template 输入 (整句作为上下文)
     messages = [
         {
             "role": "user",
@@ -111,9 +135,9 @@ def forward_for_sentence(gme_model, captured: dict, processor, image: Image.Imag
     if not visual_idx:
         raise RuntimeError("没找到 visual token")
 
-    # 定位句子在 input_ids 里的范围 (BPE 对前导空格敏感, 两种都试)
-    sentence_ids = tok.encode(sentence, add_special_tokens=False)
-    sentence_ids_space = tok.encode(" " + sentence, add_special_tokens=False)
+    # 定位 key_noun 的 subword 位置 (BPE 对前导空格敏感, 两种都试)
+    noun_ids = tok.encode(key_noun, add_special_tokens=False)
+    noun_ids_space = tok.encode(" " + key_noun, add_special_tokens=False)
 
     def find_subseq(hay: list[int], needle: list[int]) -> int:
         n = len(needle)
@@ -122,32 +146,21 @@ def forward_for_sentence(gme_model, captured: dict, processor, image: Image.Imag
                 return i
         return -1
 
-    start = find_subseq(ids_list, sentence_ids)
+    start = find_subseq(ids_list, noun_ids)
     if start < 0:
-        start = find_subseq(ids_list, sentence_ids_space)
+        start = find_subseq(ids_list, noun_ids_space)
         if start >= 0:
-            sentence_ids = sentence_ids_space
+            noun_ids = noun_ids_space
     if start < 0:
-        # 长句 BPE 可能因中间某 token 变体找不到整串; 退而求其次:
-        # 找句子最后一个单词的最后一个 token 位置
-        last_word = sentence.rstrip(".!?\"'").split()[-1]
-        last_ids = tok.encode(" " + last_word, add_special_tokens=False)
-        last_start = find_subseq(ids_list, last_ids)
-        if last_start < 0:
-            last_ids = tok.encode(last_word, add_special_tokens=False)
-            last_start = find_subseq(ids_list, last_ids)
-        if last_start < 0:
-            raise RuntimeError(
-                f"既找不到整句也找不到尾词 '{last_word}' 的 token. sentence={sentence!r}"
-            )
-        last_content_token_idx = last_start + len(last_ids) - 1
-        print(f"    [fallback] 用尾词 '{last_word}' 定位 last content token")
-    else:
-        last_content_token_idx = start + len(sentence_ids) - 1
+        raise RuntimeError(
+            f"key_noun '{key_noun}' 在 input_ids 里找不到. "
+            f"请确认它在句子 '{sentence}' 里确实出现."
+        )
 
-    decoded = tok.decode([ids_list[last_content_token_idx]])
+    target_indices = list(range(start, start + len(noun_ids)))
+    decoded = tok.decode(input_ids[0, target_indices])
     print(
-        f"    last content token @ idx={last_content_token_idx}, "
+        f"    key_noun='{key_noun}' → token 位置 {target_indices}, "
         f"decoded='{decoded}' (visual 范围: {visual_idx[0]}~{visual_idx[-1]})"
     )
 
@@ -160,9 +173,8 @@ def forward_for_sentence(gme_model, captured: dict, processor, image: Image.Imag
         raise RuntimeError(f"layer {LAYER_TO_PROBE} 未被 hook 捕获")
 
     hs = captured[LAYER_TO_PROBE]  # [1, seq, hidden]
-    # 单 target token 版本: target_idx 只有一个元素,
-    # compute_relevance_map 里的 element-wise 相乘退化为单张 map
-    rel_1d = compute_relevance_map(hs, visual_idx, [last_content_token_idx])
+    # 多 subword target: compute_relevance_map 会逐个算 → 归一化 → 相乘 (FOCUS consensus)
+    rel_1d = compute_relevance_map(hs, visual_idx, target_indices)
 
     return rel_1d, inputs.get("image_grid_thw")
 
@@ -171,16 +183,16 @@ def forward_for_sentence(gme_model, captured: dict, processor, image: Image.Imag
 # 可视化: grid 图 + 每句单独大图
 # ============================================================
 def save_grid(image: Image.Image, results: list, save_path: Path):
-    """N 行 × 2 列: heatmap | overlay."""
+    """N 行 × 2 列: heatmap | overlay. results 是 (sent, noun, rel_2d) 元组列表."""
     n = len(results)
     fig, axes = plt.subplots(n, 2, figsize=(14, 4 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
 
-    for i, (sent, rel_2d) in enumerate(results):
+    for i, (sent, noun, rel_2d) in enumerate(results):
         # 左: 低分辨率热力图
         axes[i, 0].imshow(rel_2d, cmap="hot", interpolation="nearest")
-        axes[i, 0].set_title(f"S{i+1} heatmap {rel_2d.shape}")
+        axes[i, 0].set_title(f"S{i+1} '{noun}' heatmap {rel_2d.shape}")
         axes[i, 0].axis("off")
         # 右: overlay
         heat_img = Image.fromarray((rel_2d * 255).astype(np.uint8)).resize(
@@ -189,9 +201,9 @@ def save_grid(image: Image.Image, results: list, save_path: Path):
         heat_arr = np.array(heat_img).astype(np.float32) / 255.0
         axes[i, 1].imshow(image)
         axes[i, 1].imshow(heat_arr, cmap="hot", alpha=0.5)
-        # 标题自动折行 (简单截断)
-        title = sent if len(sent) <= 90 else sent[:87] + "..."
-        axes[i, 1].set_title(f"S{i+1}: {title}", fontsize=10)
+        # 标题包含 key_noun + 句子 (截短)
+        title = sent if len(sent) <= 80 else sent[:77] + "..."
+        axes[i, 1].set_title(f"S{i+1} key='{noun}': {title}", fontsize=10)
         axes[i, 1].axis("off")
 
     plt.tight_layout()
@@ -201,8 +213,8 @@ def save_grid(image: Image.Image, results: list, save_path: Path):
 
 
 def save_per_sentence(image: Image.Image, results: list, out_dir: Path, layer: int):
-    """每句一张大图, 方便放大看."""
-    for i, (sent, rel_2d) in enumerate(results):
+    """每句一张大图, 方便放大看. results 是 (sent, noun, rel_2d) 元组列表."""
+    for i, (sent, noun, rel_2d) in enumerate(results):
         heat_img = Image.fromarray((rel_2d * 255).astype(np.uint8)).resize(
             image.size, resample=Image.BILINEAR
         )
@@ -210,7 +222,7 @@ def save_per_sentence(image: Image.Image, results: list, out_dir: Path, layer: i
         plt.figure(figsize=(10, 5))
         plt.imshow(image)
         plt.imshow(heat_arr, cmap="hot", alpha=0.5)
-        plt.title(f"S{i+1} (layer={layer}): {sent}", fontsize=11)
+        plt.title(f"S{i+1} (layer={layer}, key='{noun}'): {sent}", fontsize=11)
         plt.axis("off")
         plt.tight_layout()
         p = out_dir / f"sentence_{i+1}_layer{layer:02d}.png"
@@ -233,20 +245,21 @@ def main():
     # 3. 装 hook, 只装在目标层
     captured, cleanup = install_hidden_state_hooks(gme_model, [LAYER_TO_PROBE])
 
-    # 4. 依次跑每个句子
-    results = []  # list of (sentence, rel_2d)
+    # 4. 依次跑每个 (句子, key_noun)
+    results = []  # list of (sentence, key_noun, rel_2d)
     try:
-        for i, sent in enumerate(SENTENCES):
-            print(f"\n[句子 {i+1}/{len(SENTENCES)}] {sent!r}")
+        for i, (sent, noun) in enumerate(SENTENCES):
+            print(f"\n[句子 {i+1}/{len(SENTENCES)}] key_noun='{noun}'")
+            print(f"    {sent}")
             rel_1d, grid_thw = forward_for_sentence(
-                gme_model, captured, processor, image, sent
+                gme_model, captured, processor, image, sent, noun
             )
             rel_2d = reshape_to_2d(rel_1d, grid_thw)
             print(
                 f"    rel_2d stats: min={rel_2d.min():.3f}, max={rel_2d.max():.3f}, "
                 f"mean={rel_2d.mean():.3f}, std={rel_2d.std():.3f}"
             )
-            results.append((sent, rel_2d))
+            results.append((sent, noun, rel_2d))
     finally:
         cleanup()
 
@@ -257,15 +270,15 @@ def main():
 
     # 6. 打印判读提示
     print("\n" + "=" * 60)
-    print("判读指南")
+    print("判读指南 (每句的 target token = 人工挑的 key_noun 的 subword)")
     print("=" * 60)
-    print("  S1 (stratified cortical layers) → 应亮图左侧大片分层结构 (EC 区)")
-    print("  S2 (V-shaped granule cells)     → 应亮图顶部 V/U 形结构 (DG 区)")
-    print("  S3 (pyramidal neurons curved arc)→ 应亮图右侧弧形排列神经元 (CA1/CA3)")
-    print("  S4 (schematic block diagram)    → 应亮图左下角小插图")
+    print("  S1 key='dendrites' → 应亮图左侧分层皮层 (EC 区, 放射状树突)")
+    print("  S2 key='granule'   → 应亮图顶部 V/U 形结构 (DG 颗粒细胞层)")
+    print("  S3 key='pyramidal' → 应亮图右侧弧形排列神经元 (CA1/CA3)")
+    print("  S4 key='schematic' → 应亮图左下角小插图")
     print()
-    print("  ✅ 4 句热力图落在 4 个不同区域 → GME 真懂空间语义")
-    print("  ⚠️  都亮同一处 / 全糊        → 之前 subiculum 的成功可能靠认字")
+    print("  ✅ 4 张热力图落在 4 个不同区域 → GME 对不同主题词激活不同区域")
+    print("  ⚠️  都亮同一处 / 全糊           → 对齐性有限, 需要换策略")
     print()
     print(f"结果: {OUT_DIR}")
 
