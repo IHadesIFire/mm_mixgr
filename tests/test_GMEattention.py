@@ -140,50 +140,59 @@ def load_gme():
 # ============================================================
 # Step 3: 定位 "底层 Qwen2VL" 的 forward 入口
 # ============================================================
-def get_base_qwen2vl(gme_model):
+def get_base_forward(gme_model):
     """
-    找到 Qwen2VLForConditionalGeneration 层(能吃 pixel_values + image_grid_thw 的那层).
-    Qwen2VLModel 是它的子模块, 只能吃 inputs_embeds, 不吃 pixel_values ——
-    之前栽在这上面过. 所以必须精确匹配 "ForConditionalGeneration" 后缀.
+    返回一个 forward 函数, 它跑 Qwen2VLForConditionalGeneration 的 forward,
+    返回带 hidden_states 的 ModelOutput(绕过 GME 的池化 override).
+
+    GME 的两种可能结构:
+    (A) GmeQwen2VL 继承自 Qwen2VLForConditionalGeneration, override 了 forward
+        → 用 父类.forward(gme_model, **kwargs) 绕过 override
+    (B) GmeQwen2VL 里挂了 .base / .model = Qwen2VLForConditionalGeneration
+        → 直接调 sub.forward
     """
-    print("[3/6] 定位 Qwen2VLForConditionalGeneration ...")
+    print("[3/6] 定位 Qwen2VLForConditionalGeneration.forward ...")
 
-    # 只认严格的 class 名后缀, 不看 forward 签名 ——
-    # GME 外层 forward 也吃 pixel_values (kwargs 透传), 但它返回的是池化 embedding,
-    # 不是 ModelOutput, 拿不到 hidden_states. 必须找底层 Qwen2VLForConditionalGeneration.
-    def _is_cond_gen(m) -> bool:
-        return type(m).__name__.endswith("ForConditionalGeneration")
+    # 方案 A: 检查继承链
+    for base in type(gme_model).__mro__[1:]:  # 跳过 GME 自己
+        if base.__name__.endswith("ForConditionalGeneration"):
+            print(f"    GME 继承自 {base.__name__}, 用父类 forward 绕开 GME 的池化 override")
+            def _fwd(**kwargs):
+                return base.forward(gme_model, **kwargs)
+            return _fwd
 
-    # 1) 一级子属性优先 (GME 的标准结构: gme_model.base = Qwen2VLForConditionalGeneration)
+    # 方案 B: 检查一级子属性
     for attr in ["base", "model", "vlm", "qwen2_vl"]:
         if hasattr(gme_model, attr):
             sub = getattr(gme_model, attr)
             print(f"    候选: gme_model.{attr} → {type(sub).__name__}")
-            if _is_cond_gen(sub):
-                print(f"    选用: gme_model.{attr}")
-                return sub
+            if type(sub).__name__.endswith("ForConditionalGeneration"):
+                print(f"    选用: gme_model.{attr}.forward")
+                return sub.forward
 
-    # 2) 广度扫描
+    # 兜底: 广度扫
     print("    一级没找到, 广度扫 named_modules ...")
     for name, mod in gme_model.named_modules():
-        if _is_cond_gen(mod):
-            print(f"    选用: gme_model.{name} → {type(mod).__name__}")
-            return mod
+        if type(mod).__name__.endswith("ForConditionalGeneration"):
+            print(f"    选用: gme_model.{name}.forward")
+            return mod.forward
 
-    # 3) gme_model 自己就是(兜底)
-    if _is_cond_gen(gme_model):
-        print(f"    兜底: gme_model 自己就是 {type(gme_model).__name__}")
-        return gme_model
-
+    # 还没找到: 打印 MRO 和 children 帮排查
+    print("    诊断信息:")
+    print(f"      gme_model type = {type(gme_model).__name__}")
+    print(f"      MRO = {[b.__name__ for b in type(gme_model).__mro__]}")
+    print("      named_children:")
+    for name, sub in gme_model.named_children():
+        print(f"        {name}: {type(sub).__name__}")
     raise RuntimeError(
-        f"找不到 Qwen2VLForConditionalGeneration. gme_model 类型 = {type(gme_model).__name__}"
+        "找不到 Qwen2VLForConditionalGeneration 的 forward"
     )
 
 
 # ============================================================
 # Step 4: 构造输入 & forward 拿 hidden_states
 # ============================================================
-def forward_and_get_hidden_states(model, processor, image: Image.Image, query_text: str):
+def forward_and_get_hidden_states(fwd_fn, processor, image: Image.Image, query_text: str):
     """
     用 Qwen2-VL 的 chat template 构造 (image, text) 输入, forward 一次, 返回:
       - hidden_states: tuple of [1, seq_len, hidden_dim], 长度 = num_layers+1 (含 embedding)
@@ -270,11 +279,11 @@ def forward_and_get_hidden_states(model, processor, image: Image.Image, query_te
     decoded = tok.decode(input_ids[0, target_token_indices])
     print(f"    decoded target tokens: '{decoded}'")
 
-    # Forward
-    # 底层 Qwen2VL 的 forward 支持 output_hidden_states
+    # Forward: fwd_fn 是 Qwen2VLForConditionalGeneration.forward 的绑定版本,
+    # 绕开 GME 的池化 override, 返回带 hidden_states 的 ModelOutput
     print("    forward...")
     with torch.inference_mode():
-        outputs = model(
+        outputs = fwd_fn(
             **inputs,
             output_hidden_states=True,
             return_dict=True,
@@ -284,8 +293,7 @@ def forward_and_get_hidden_states(model, processor, image: Image.Image, query_te
     if isinstance(outputs, torch.Tensor):
         raise RuntimeError(
             f"forward 返回了 Tensor shape={tuple(outputs.shape)}, "
-            f"说明 base 定位错了, 落到 GME 外层 forward 了. "
-            f"base 类型应该是 *ForConditionalGeneration, 实际 = {type(model).__name__}"
+            f"说明 fwd_fn 定位错了, 落到 GME 外层 forward 了."
         )
     if not hasattr(outputs, "hidden_states") or outputs.hidden_states is None:
         raise RuntimeError(
@@ -425,13 +433,13 @@ def main():
     # 2. 加载 GME
     gme_model, processor = load_gme()
 
-    # 3. 定位底层 forward (有的版本 GME 自己就暴露 forward, 直接试)
-    base = get_base_qwen2vl(gme_model)
+    # 3. 定位 Qwen2VLForConditionalGeneration.forward, 绕开 GME 池化
+    fwd_fn = get_base_forward(gme_model)
 
     # 4. Forward + 拿 hidden_states
     # 用 FOCUS 论文的 existence prompt 格式, 让 target 作为自然句里的一个 token 出现
     query_text = f"Is there a {TARGET_WORD} in the image?"
-    data = forward_and_get_hidden_states(base, processor, image, query_text)
+    data = forward_and_get_hidden_states(fwd_fn, processor, image, query_text)
 
     hidden_states = data["hidden_states"]
     visual_idx = data["visual_token_indices"]
