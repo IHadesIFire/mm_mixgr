@@ -12,3 +12,8 @@ content/
 *.npy
 *.pt
 *.pth
+
+# 大数据 / 二进制产物, 不进 git(走 Drive)
+data/benchmark_v1/
+*.zip
+*.pptx
