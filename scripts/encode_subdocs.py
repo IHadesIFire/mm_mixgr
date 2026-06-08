@@ -11,19 +11,28 @@
   - 纯文本 corpus doc(没有 image 的)的 prop: 从命题缓存现读, 纯文本编码.
   - 完全没有命题缓存的 doc: 整 doc 兜底编码一条(prop_idx=-1), 保证每个 corpus doc 至少一个向量、可被检索到.
 
-输出: data/benchmark_v1/subdoc_embeddings/
+焦点图(grounded prop)有三种做法, 由 --focus_mode 选:
+  - context_crop (默认): 裁 grounding 框 + 四周留 --context_margin 边距(目标高分辨率 + 局部上下文)
+  - crop                : 裁紧 grounding 框(目标吃满 token, 无背景)
+  - brb                 : Blur Reverse Box, 框内清晰、框外高斯模糊 σ=--blur_sigma(默认 100, 对标 FGVP)
+  依据: FGVP(NeurIPS 2023)用固定 σ=100, 且其 Box 变体在 RefCOCO 上还弱于直接 crop;
+  故默认改用 context_crop。各方案请用 nDCG 在子集上 ablate 后再定全量用哪个。
+
+输出: data/benchmark_v1/subdoc_embeddings_<tag>/  (<tag> 默认=focus_mode, brb 带 σ; --out_tag 可覆盖)
   - embeddings.npy : (N, D) float32, 所有子文档向量
   - meta.jsonl     : 每行一条, 与 embeddings 行一一对应:
                      {row, prop_id, corpus_id, prop_idx, modality, grounded, has_image, source}
   - encode_stats.json : 统计
   - shards/ + manifest.jsonl : 中间产物, 支持断点续跑(按 chunk 粒度), finalize 时重建上面两个最终文件
+  注: 不同 focus_mode 写到不同目录, 互不串断点 → 可各自全量编、出多版做对比。
 
 依赖: 需要 GPU(GME-7B ~15GB). 在 Colab 跑(先把 data/benchmark_v1 + cache/decompositions 传到位).
 
-跑(pilot, 只处理前 20 个 doc):
-    python -u -m scripts.encode_subdocs --limit 20 --batch_size 8 --save_focus_samples 12
+跑(pilot, 前 20 个 doc, 顺便存焦点图抽查):
+    python -u -m scripts.encode_subdocs --focus_mode context_crop --limit 20 --batch_size 8 --save_focus_samples 12
 跑(全量):
-    python -u -m scripts.encode_subdocs --batch_size 16
+    python -u -m scripts.encode_subdocs --focus_mode context_crop --batch_size 16
+对比其它方案: --focus_mode 换成 crop / brb (brb 可再调 --blur_sigma) 各跑一版。
 断点续跑: 重跑同一条命令即可(已完成的 chunk 会跳过).
 """
 from __future__ import annotations
@@ -83,51 +92,85 @@ def props_from_cache(text: str):
         return None
 
 
-# ---------------- Blur Reverse Box(FGVP 的 Box 变体)----------------
-def blur_reverse_box(img: Image.Image, regions: list, blur_ratio: float):
-    """region 内保留清晰原图, region 外高斯模糊. 返回焦点图; 无有效 box 返回 None.
-
-    bbox_norm 是 0-1000 归一化坐标, 与图像分辨率无关, 所以可直接按当前尺寸反算.
-    模糊半径按图像长边比例缩放(FGVP 在 ~640px 图上用 σ≈100, 即比例 ~0.15),
-    以适配本 benchmark 里 250px~2000px 的悬殊尺寸。
-    """
-    img = img.convert("RGB")
-    W, H = img.size
-    radius = max(MIN_BLUR_RADIUS, blur_ratio * max(W, H))
-    blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
-
-    mask = Image.new("L", (W, H), 0)
-    draw = ImageDraw.Draw(mask)
-    any_box = False
+# ---------------- 焦点图: 把 grounding 区域做成 sub-doc 视图 ----------------
+def _regions_to_px_boxes(regions, W, H):
+    """bbox_norm(0-1000) -> 像素框列表. 纠正 min/max 顺序、裁到画面内、取整、小框 clamp 到 >=1px;
+    画不出的丢弃。返回 [(x1,y1,x2,y2), ...] (空 = 无有效框)。"""
+    boxes = []
     for reg in regions or []:
         bb = reg.get("bbox_norm")
         if not bb or len(bb) != 4:
             continue
         x1, y1, x2, y2 = bb
-        # 归一化 -> 像素, 纠正 min/max 顺序、裁剪到画面内、四舍五入取整
         px1 = max(0.0, min(float(W), min(x1, x2) / 1000.0 * W))
         px2 = max(0.0, min(float(W), max(x1, x2) / 1000.0 * W))
         py1 = max(0.0, min(float(H), min(y1, y2) / 1000.0 * H))
         py2 = max(0.0, min(float(H), max(y1, y2) / 1000.0 * H))
         ix1, iy1, ix2, iy2 = round(px1), round(py1), round(px2), round(py2)
-        # 小框 clamp 到至少 1px(而不是静默丢弃 -> 否则整条 prop 退化成纯文本, 丢掉 grounding)
         if ix2 <= ix1:
             ix2 = min(W, ix1 + 1)
         if iy2 <= iy1:
             iy2 = min(H, iy1 + 1)
         if ix2 <= ix1 or iy2 <= iy1:   # 图本身 <1px, 实在画不出框
             continue
+        boxes.append((ix1, iy1, ix2, iy2))
+    return boxes
+
+
+def blur_reverse_box(img: Image.Image, boxes: list, blur_sigma: float, blur_ratio: float = 0.0):
+    """Blur Reverse Box(FGVP 的 Box 变体): box 内清晰、box 外高斯模糊.
+
+    FGVP 原文用固定 σ=100(executor.py blur_std_dev=100, 同一个 PIL GaussianBlur),
+    所以默认走固定 blur_sigma; 仅当 blur_ratio>0 时退回"按长边比例"的老行为。
+    """
+    img = img.convert("RGB")
+    W, H = img.size
+    radius = blur_ratio * max(W, H) if blur_ratio and blur_ratio > 0 else blur_sigma
+    radius = max(MIN_BLUR_RADIUS, radius)
+    blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
+    mask = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(mask)
+    for (ix1, iy1, ix2, iy2) in boxes:
         draw.rectangle([ix1, iy1, ix2, iy2], fill=255)
-        any_box = True
-    if not any_box:
+    return Image.composite(img, blurred, mask)   # 255 处清晰, 0 处模糊
+
+
+def crop_union_box(img: Image.Image, boxes: list, margin: float = 0.0):
+    """裁剪所有 box 的并集外接框; margin>0 时四周按框尺寸比例外扩(context crop)。"""
+    img = img.convert("RGB")
+    W, H = img.size
+    x1 = min(b[0] for b in boxes)
+    y1 = min(b[1] for b in boxes)
+    x2 = max(b[2] for b in boxes)
+    y2 = max(b[3] for b in boxes)
+    if margin and margin > 0:
+        mw = (x2 - x1) * margin
+        mh = (y2 - y1) * margin
+        x1 = max(0, int(round(x1 - mw)))
+        y1 = max(0, int(round(y1 - mh)))
+        x2 = min(W, int(round(x2 + mw)))
+        y2 = min(H, int(round(y2 + mh)))
+    return img.crop((x1, y1, x2, y2))
+
+
+def build_focus(pil_image, regions, focus_mode, blur_sigma, blur_ratio, context_margin):
+    """按 focus_mode 把 grounding 区域做成焦点图. 无有效 box -> None(调用方退化纯文本)。"""
+    if pil_image is None:
         return None
-    # mask=255 处取清晰原图, =0 处取模糊图
-    return Image.composite(img, blurred, mask)
+    W, H = pil_image.size
+    boxes = _regions_to_px_boxes(regions, W, H)
+    if not boxes:
+        return None
+    if focus_mode == "crop":
+        return crop_union_box(pil_image, boxes, margin=0.0)
+    if focus_mode == "context_crop":
+        return crop_union_box(pil_image, boxes, margin=context_margin)
+    return blur_reverse_box(pil_image, boxes, blur_sigma, blur_ratio)   # brb
 
 
 # ---------------- 构造一个 doc 的所有子文档 item ----------------
 def build_items_for_doc(cid, text, modality, pil_image, ground_recs,
-                        blur_ratio, ungrounded_mode):
+                        focus_mode, blur_sigma, blur_ratio, context_margin, ungrounded_mode):
     """返回 (items, metas), 两者一一对应. item 给 encoder(含 id/modality/text/image),
     meta 给落盘(记录来源/是否 grounded 等). 同时返回少量焦点图供抽查 (focus_samples)。
     """
@@ -163,9 +206,9 @@ def build_items_for_doc(cid, text, modality, pil_image, ground_recs,
             grounded = rec.get("grounded") is True
             regions = rec.get("regions") or []
             if grounded and regions and pil_image is not None:
-                focus = blur_reverse_box(pil_image, regions, blur_ratio)
+                focus = build_focus(pil_image, regions, focus_mode, blur_sigma, blur_ratio, context_margin)
                 if focus is not None:
-                    add(pid, pidx, "image,text", ptext, focus, True, "grounded_brb")
+                    add(pid, pidx, "image,text", ptext, focus, True, f"grounded_{focus_mode}")
                     focus_samples.append((pid, focus))
                     continue
                 # grounded=True 但 box 全部无效 -> 退化纯文本(grounded 标记如实保留)
@@ -275,18 +318,38 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--device", default=cfg.model.device)
-    ap.add_argument("--blur_ratio", type=float, default=0.15,
-                    help="高斯模糊半径 / 图像长边 的比例(FGVP σ≈100@640px → ~0.15)")
+    ap.add_argument("--focus_mode", choices=["context_crop", "crop", "brb"], default="context_crop",
+                    help="grounded prop 的焦点图: context_crop=裁框+留边距(默认) / crop=裁紧框 / brb=模糊背景(FGVP Box变体)")
+    ap.add_argument("--context_margin", type=float, default=0.25,
+                    help="context_crop 四周外扩比例(占框尺寸), 默认 0.25")
+    ap.add_argument("--blur_sigma", type=float, default=100.0,
+                    help="brb 模式的高斯模糊 σ(固定像素, 对标 FGVP=100)")
+    ap.add_argument("--blur_ratio", type=float, default=0.0,
+                    help="brb 模式: >0 则模糊半径=blur_ratio*长边(老行为); =0(默认)用固定 --blur_sigma")
+    ap.add_argument("--out_tag", default=None,
+                    help="输出子目录后缀, 默认按 focus_mode 自动命名; 不同 mode 写不同目录, 互不串断点")
     ap.add_argument("--chunk_docs", type=int, default=50,
                     help="每多少个 doc 落一次盘(断点粒度; 太大会在内存里堆太多 PIL 焦点图, Colab 易 OOM)")
     ap.add_argument("--ungrounded_mode", choices=["text", "wholeimage"], default="text",
                     help="grounded=False 的 prop 怎么编码: text=纯文本(默认) / wholeimage=prop+整图")
     ap.add_argument("--limit", type=int, default=None, help="只处理前 N 个 doc(pilot)")
     ap.add_argument("--save_focus_samples", type=int, default=0,
-                    help="额外存几张 BRB 焦点图供肉眼抽查")
+                    help="额外存几张焦点图供肉眼抽查")
     ap.add_argument("--finalize_only", action="store_true",
                     help="跳过编码, 只用已有 shards 重建 embeddings.npy + meta.jsonl")
     args = ap.parse_args()
+
+    # 按 focus 配置选输出目录: 不同方案互不覆盖、互不串断点, 方便做 ablation
+    global OUT_DIR, SHARD_DIR, MANIFEST, EMB_OUT, META_OUT, STATS_OUT, FOCUS_SAMPLE_DIR
+    tag = args.out_tag or (f"brb_s{int(args.blur_sigma)}" if args.focus_mode == "brb" else args.focus_mode)
+    OUT_DIR = BENCH / f"subdoc_embeddings_{tag}"
+    SHARD_DIR = OUT_DIR / "shards"
+    MANIFEST = OUT_DIR / "manifest.jsonl"
+    EMB_OUT = OUT_DIR / "embeddings.npy"
+    META_OUT = OUT_DIR / "meta.jsonl"
+    STATS_OUT = OUT_DIR / "encode_stats.json"
+    FOCUS_SAMPLE_DIR = OUT_DIR / "focus_samples"
+    print(f"      输出目录 = {OUT_DIR}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
@@ -330,7 +393,8 @@ def main():
 
     # 4. 按 chunk_docs 分块处理
     print(f"[4/4] 分块编码(chunk_docs={args.chunk_docs}, batch={args.batch_size}, "
-          f"blur_ratio={args.blur_ratio}, ungrounded={args.ungrounded_mode}) ...")
+          f"focus_mode={args.focus_mode}, blur_sigma={args.blur_sigma}, blur_ratio={args.blur_ratio}, "
+          f"context_margin={args.context_margin}, ungrounded={args.ungrounded_mode}) ...")
     chunk_idx = max_chunk + 1
     n_focus_saved = 0
     src_counter: dict[str, int] = {}
@@ -382,7 +446,8 @@ def main():
             pil = resize_image(_ensure_pil_image(row.get("image")))
             items, metas, focus_samples = build_items_for_doc(
                 cid, text, modality, pil, ground_by_doc.get(cid),
-                args.blur_ratio, args.ungrounded_mode)
+                args.focus_mode, args.blur_sigma, args.blur_ratio, args.context_margin,
+                args.ungrounded_mode)
 
             # 抽查焦点图
             while args.save_focus_samples and n_focus_saved < args.save_focus_samples and focus_samples:
@@ -413,7 +478,10 @@ def main():
         "n_subdoc_total": n_total,
         "n_new_this_run": total_new,
         "source_breakdown_this_run": src_counter,
+        "focus_mode": args.focus_mode,
+        "blur_sigma": args.blur_sigma,
         "blur_ratio": args.blur_ratio,
+        "context_margin": args.context_margin,
         "ungrounded_mode": args.ungrounded_mode,
         "focus_samples_saved": n_focus_saved,
     }
