@@ -12,11 +12,11 @@
   - 完全没有命题缓存的 doc: 整 doc 兜底编码一条(prop_idx=-1), 保证每个 corpus doc 至少一个向量、可被检索到.
 
 焦点图(grounded prop)有三种做法, 由 --focus_mode 选:
-  - context_crop (默认): 裁 grounding 框 + 四周留 --context_margin 边距(目标高分辨率 + 局部上下文)
-  - crop                : 裁紧 grounding 框(目标吃满 token, 无背景)
+  - crop         (默认): 裁紧对应 bbox(无边距; 该 prop 的所有框取并集外接框)
+  - context_crop        : 裁 bbox + 四周留 --context_margin 边距
   - brb                 : Blur Reverse Box, 框内清晰、框外高斯模糊 σ=--blur_sigma(默认 100, 对标 FGVP)
-  依据: FGVP(NeurIPS 2023)用固定 σ=100, 且其 Box 变体在 RefCOCO 上还弱于直接 crop;
-  故默认改用 context_crop。各方案请用 nDCG 在子集上 ablate 后再定全量用哪个。
+  依据: FGVP(NeurIPS 2023)用固定 σ=100, 且其 Box 变体在 RefCOCO 上还弱于直接 crop。
+  默认 crop(不留边距); 其它方案可用 nDCG 在子集上 ablate。
 
 输出: data/benchmark_v1/subdoc_embeddings_<tag>/  (<tag> 默认=focus_mode, brb 带 σ; --out_tag 可覆盖)
   - embeddings.npy : (N, D) float32, 所有子文档向量
@@ -29,10 +29,10 @@
 依赖: 需要 GPU(GME-7B ~15GB). 在 Colab 跑(先把 data/benchmark_v1 + cache/decompositions 传到位).
 
 跑(pilot, 前 20 个 doc, 顺便存焦点图抽查):
-    python -u -m scripts.encode_subdocs --focus_mode context_crop --limit 20 --batch_size 8 --save_focus_samples 12
+    python -u -m scripts.encode_subdocs --focus_mode crop --limit 20 --batch_size 8 --save_focus_samples 12
 跑(全量):
-    python -u -m scripts.encode_subdocs --focus_mode context_crop --batch_size 16
-对比其它方案: --focus_mode 换成 crop / brb (brb 可再调 --blur_sigma) 各跑一版。
+    python -u -m scripts.encode_subdocs --focus_mode crop --batch_size 16
+对比其它方案: --focus_mode 换成 context_crop / brb (brb 可再调 --blur_sigma) 各跑一版。
 断点续跑: 重跑同一条命令即可(已完成的 chunk 会跳过).
 """
 from __future__ import annotations
@@ -318,8 +318,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--device", default=cfg.model.device)
-    ap.add_argument("--focus_mode", choices=["context_crop", "crop", "brb"], default="context_crop",
-                    help="grounded prop 的焦点图: context_crop=裁框+留边距(默认) / crop=裁紧框 / brb=模糊背景(FGVP Box变体)")
+    ap.add_argument("--focus_mode", choices=["crop", "context_crop", "brb"], default="crop",
+                    help="grounded prop 的焦点图: crop=裁紧对应bbox(默认, 无边距) / context_crop=裁框+留边距 / brb=模糊背景(FGVP Box变体)")
     ap.add_argument("--context_margin", type=float, default=0.25,
                     help="context_crop 四周外扩比例(占框尺寸), 默认 0.25")
     ap.add_argument("--blur_sigma", type=float, default=100.0,
