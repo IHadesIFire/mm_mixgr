@@ -93,27 +93,48 @@ def props_from_cache(text: str):
 
 
 # ---------------- 焦点图: 把 grounding 区域做成 sub-doc 视图 ----------------
+def _num(v):
+    """把可能被包成 [x] / [[x]] 的标量取出来; 取不到数字返回 None。"""
+    while isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def _coerce_quads(bb):
+    """从可能畸形的 bbox_norm 抠出若干 [x1,y1,x2,y2] 数值四元组。
+    兼容: 扁平四元组 / 嵌套多框 [[...],[...]] / 坐标被包成 [x]。抠不出就返回 []，不抛异常。"""
+    if not isinstance(bb, (list, tuple)) or not bb:
+        return []
+    if all(isinstance(e, (list, tuple)) for e in bb):      # 嵌套多框
+        out = []
+        for e in bb:
+            out += _coerce_quads(e)
+        return out
+    if len(bb) == 4:                                       # 扁平四元组(坐标可能被包成 [x])
+        vals = [_num(c) for c in bb]
+        if all(v is not None for v in vals):
+            return [vals]
+    return []
+
+
 def _regions_to_px_boxes(regions, W, H):
     """bbox_norm(0-1000) -> 像素框列表. 纠正 min/max 顺序、裁到画面内、取整、小框 clamp 到 >=1px;
-    画不出的丢弃。返回 [(x1,y1,x2,y2), ...] (空 = 无有效框)。"""
+    畸形/画不出的丢弃(不抛异常)。返回 [(x1,y1,x2,y2), ...] (空 = 无有效框)。"""
     boxes = []
     for reg in regions or []:
-        bb = reg.get("bbox_norm")
-        if not bb or len(bb) != 4:
-            continue
-        x1, y1, x2, y2 = bb
-        px1 = max(0.0, min(float(W), min(x1, x2) / 1000.0 * W))
-        px2 = max(0.0, min(float(W), max(x1, x2) / 1000.0 * W))
-        py1 = max(0.0, min(float(H), min(y1, y2) / 1000.0 * H))
-        py2 = max(0.0, min(float(H), max(y1, y2) / 1000.0 * H))
-        ix1, iy1, ix2, iy2 = round(px1), round(py1), round(px2), round(py2)
-        if ix2 <= ix1:
-            ix2 = min(W, ix1 + 1)
-        if iy2 <= iy1:
-            iy2 = min(H, iy1 + 1)
-        if ix2 <= ix1 or iy2 <= iy1:   # 图本身 <1px, 实在画不出框
-            continue
-        boxes.append((ix1, iy1, ix2, iy2))
+        for x1, y1, x2, y2 in _coerce_quads(reg.get("bbox_norm")):
+            px1 = max(0.0, min(float(W), min(x1, x2) / 1000.0 * W))
+            px2 = max(0.0, min(float(W), max(x1, x2) / 1000.0 * W))
+            py1 = max(0.0, min(float(H), min(y1, y2) / 1000.0 * H))
+            py2 = max(0.0, min(float(H), max(y1, y2) / 1000.0 * H))
+            ix1, iy1, ix2, iy2 = round(px1), round(py1), round(px2), round(py2)
+            if ix2 <= ix1:
+                ix2 = min(W, ix1 + 1)
+            if iy2 <= iy1:
+                iy2 = min(H, iy1 + 1)
+            if ix2 <= ix1 or iy2 <= iy1:   # 图本身 <1px, 实在画不出框
+                continue
+            boxes.append((ix1, iy1, ix2, iy2))
     return boxes
 
 
